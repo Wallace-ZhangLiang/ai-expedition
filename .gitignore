@@ -1,0 +1,31 @@
+# 内部 / 工作资料（不进公开仓库）
+CLAUDE.md
+汇报*
+昇腾*.md
+vllm-scan/
+
+# 系统 / 临时文件
+~$*
+*.tmp
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 模型 / 大文件（权重、数据不进仓库）
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.bin
