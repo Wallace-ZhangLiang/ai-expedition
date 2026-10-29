@@ -307,96 +307,22 @@ ninja   # 只重编改动的 .o + 重链接 .so
 
 ---
 
-## 五、实战复盘：两个真实 issue 是怎么做的
-
-> 这一节是「上手」的精华。两个案例都是真实的昇腾后端问题，一个是已提交的 PR，一个是最近定位的 issue。看它们不是看结果，而是看**方法**——两件事用的是同一套「复现 → 抓 IR → 追链 → 定位代码」的流程。
-
-### 5.1 案例一：`tl.flip` 报对齐失败 + UB 溢出
-
-**报错**：`compile_mode: "simd"` 下，`tl.flip(x, dim=1)` 对 `64×64` 张量翻转，报 `cannot align N axis` + `ub overflow`。
-
-**定位过程**（这套流程请背下来）：
-
-1. **复现**：写最小脚本，确定「去掉 `tl.flip` 就过、`BLOCK_SIZE` 从 64 降到 32 也过」 → 锁定是 `tl.flip`。
-2. **抓 IR**：dump 出 `ttir / 后端 IR / npuir` 多级 IR。
-3. **锁阶段**：`grep expand_shape` 发现 `memref.expand_shape` 只出现在最底层 IR，不在 linalg → 生成点在底层 bufferization。
-4. **追链**：`tt.reshape`（ttir）→ `tensor.reshape`（linalg）→ `memref.expand_shape`（npuir）→ 对齐 pass 报错。
-5. **定位代码**：在报错信息附近定位到是「对齐传播」pass 无法穿过这种 reshape。
-
-**根因（一句话）**：`tl.flip` 没有原生 reverse 算子，前端把它展开成 **bit-reversal**——把 64 长的轴 reshape 成 `64×2×2×2×2×2×2`，这个 reshape 在下游对齐 pass 里无法传播对齐信息，报错。
-
-**方案选择**（这是最值得学的一步）：
-
-| 落点 | 归属 | 能否直接提 PR |
-|---|---|---|
-| 改底层对齐 pass | 独立的 NPU-IR 仓库 | ❌ 只能提 issue |
-| 改 `standard.py` 的 flip 实现 | 上游 triton 通用代码 | ❌ 通用文件里塞后端私活，上游不接 |
-| **在后端适配层接线原生 flip** | **triton-ascend 自己的适配层** | ✅ **落这里** |
-
-**为什么选「接线」**：仓库里其实**早就埋好了一个原生 flip 算子，只是一直没人用**（孤儿 op）。整条原生链每一段都真实存在，唯一缺的是「没有代码去制造它」。所以解法是：**写一个 pattern（图案匹配器），把 bit-reversal 那套固定图案认出来，整段重写成原生 flip**，绕过崩人的 reshape。
-
-**一句话记住这个方案**：*不造新轮子，把已经铺好的高速公路的入口匝道接上。*
-
-**结果**：末维 flip 从 bit-reversal 变成单条原生向量翻转，典型尺寸下从几百 µs 降到十几 µs（约 20× 加速），更大的尺寸 bit-reversal 直接编译失败、原生 flip 能过。
-
-**三个新手能带走的方法论**：
-1. **改 bug 前先想「落点归属」**——底层依赖、上游通用代码、还是自己的适配层？只有最后一个能直接提 PR。
-2. **孤儿 op 是最省事的修法**——如果仓库里已有原生算子、只是没接线，就别去改底层。
-3. **pattern 的规矩是「宁可错过，不能改错」**——每一步严格校验，任何一步对不上就原样返回，绝不乱改别的 op。
-
-### 5.2 案例二：no-op `tl.permute` 被降成真转置导致 UB 溢出
-
-**报错**：`ub overflow`（约 2.17× 超量）。
-
-**根因（一句话）**：`tl.permute(x, (1, 0))` 把 `(1, 4096)` 转成 `(4096, 1)`，两个形状的行主序**完全相同**（等价于一次 reshape，数据一字不动）。但它在后端被**无条件降成真正的 `linalg.transpose`**，底层又把这个转置当矩阵转置用分块布局做，缓冲区放大 8 倍，片上内存爆掉。
-
-**决定性的实验**（定位 no-op 的经典手法）：
-
-```python
-# 同一个 kernel，只改一行：
-tl.permute(floored, (1, 0))      # tt.trans → ub overflow ❌
-tl.reshape(floored, (4096, 1))   # tt.reshape → 编译通过 ✅
-```
-
-两者产出的 `(4096,1)` 数据逐位相同，唯一区别是 `tt.trans` vs `tt.reshape`。这证明：**罪魁就是 no-op 转置被当成了真转置**。
-
-**修复方向**：在转置的统一出口里加一个 no-op 判断——**若 permutation 只挪动 size-1 的维、非单例维的相对顺序不变，就是 no-op 转置，直接降成 reshape**，而不是 `linalg.transpose`。判定是标准结论 O(rank)：
-
-```cpp
-// 非单例维在 perm 下的目标位置必须严格递增；有任何一个往回退就是真转置。
-static bool isNoOpPermutation(shape, perm) {
-  int64_t lastPos = -1;
-  for (int i = 0; i < shape.size(); ++i) {
-    if (shape[i] <= 1) continue;           // 单例维可自由移动
-    if (perm[i] <= lastPos) return false;  // 非单例维往回退 → 真转置
-    lastPos = perm[i];
-  }
-  return true;
-}
-```
-
-**两个案例的共同方法论**：
-- 都是「**复现 → 抓多级 IR → 追 lowering 链 → 定位到一个适配层函数 → 改它**」。
-- 都落在**自己的后端适配层**，不碰底层依赖、不碰上游通用代码。
-- 都用「**把语义上等价但更贵的路径，换成更便宜的原生路径**」来修。
-
----
-
-## 六、学习路线总览与建议节奏
+## 五、学习路线总览与建议节奏
 
 ```
 阶段 0  跑通第一个 kernel（半天~1天）      → 块思维 + 三原语
 阶段 1  搞懂原理 + 会读 IR（3~5天）        → 编译旅程 + IR 分层
 阶段 2  看懂编译器背景（半天）             → LLVM / MLIR / 两条后端路线
 阶段 3  上手开发（1~2周，边做边学）        → 源码编译 + 改 bug 工作流
-阶段 4  实战复盘（贯穿始终）               → 用真实 issue 当教材
+阶段 4  实战复盘（贯穿始终）               → 独立挑一个 issue 走一遍完整定位流程
 ```
 
 - **节奏**：建议 `1h 概念 + 1.5~2h 动手`，每天连续投入，比周末突击有效。
 - **每个 kernel 记一行性能数字**，建立「性能直觉」。
 - **第一个 PR 目标**：一个 pass 小修复 + 一个 lit/pytest 测试（小而完整），别一上来就啃大需求。
+- **阶段 4 的实战案例**：两个真实 issue 的完整定位过程，各一篇——[`tl.flip` 对齐失败与 UB 溢出](../deep-dives/triton-backend-issue复盘/Triton后端issue复盘-tl-flip案例.md)、[no-op `tl.permute` 导致 UB 溢出](../deep-dives/triton-backend-issue复盘/Triton后端issue复盘-tl-permute案例.md)。
 
-## 七、资源清单
+## 六、资源清单
 
 | 资源 | 用途 |
 |---|---|
@@ -408,8 +334,10 @@ static bool isNoOpPermutation(shape, perm) {
 | 仓库 `unittest/Conversion/**/*.mlir` | pass 契约（lit 测试，读它理解每个 pass） |
 | vLLM / vllm-ascend 源码 | 真实 kernel 素材（拿真实算子对照概念读，比看教程快 10 倍） |
 | 昇腾官方文档 | CANN / torch_npu 版本对应表 |
+| [实战复盘：`tl.flip` 对齐失败与 UB 溢出](../deep-dives/triton-backend-issue复盘/Triton后端issue复盘-tl-flip案例.md) | 阶段 4 配套：bit-reversal → 原生 flip 的定位过程 |
+| [实战复盘：no-op `tl.permute` 导致 UB 溢出](../deep-dives/triton-backend-issue复盘/Triton后端issue复盘-tl-permute案例.md) | 阶段 4 配套：no-op 转置被降成真转置的定位过程 |
 
-## 八、常见坑 FAQ
+## 七、常见坑 FAQ
 
 | 症状 | 原因 / 解决 |
 |---|---|
